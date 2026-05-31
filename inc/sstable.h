@@ -17,6 +17,7 @@
 #include <filesystem>
 
 #include "skip_list.h"
+#include "bloom_filter.h"
 
 namespace fs = std::filesystem;
 
@@ -107,23 +108,37 @@ class SSTable {
       WriteBinary(out, entry.second);      // 偏移量（8字节）
     }
 
-    // 写入 Footer：索引区的起始偏移量（8字节）
+    // --- 布隆过滤器（基于所有有效键）---
+    BloomFilter<K> filter(10, index.size()); // bits_per_key = 10
+    for (const auto &entry : data) {
+      if (!std::get<2>(entry)) {             // 非墓碑键
+        filter.Add(std::get<0>(entry));
+      }
+    }
+    std::string filter_data=filter.Serialize();
+    uint64_t bloom_offset = out.tellp();
+    uint32_t filter_size = static_cast<uint32_t>(filter_data.size());
+    WriteBinary(out,filter_size);
+    out.write(filter_data.data(),filter_size);
+
+    // 写入 Footer：索引区的起始偏移量（8字节）布隆过滤器偏移 (8字节)
     uint64_t index_offset = offset;
     WriteBinary(out, index_offset);
+    WriteBinary(out,bloom_offset);
 
     out.close();
     return static_cast<bool>(out);
   }
 
   // 打开已有 SSTable 文件，加载索引到内存
-  explicit SSTable(const std::string &filename) : filename_(filename), file_size_(0) {
+  explicit SSTable(const std::string &filename) : filename_(filename), file_size_(0),bloom_filter_(10,1000) {
     // 获取文件大小
     std::ifstream in(filename, std::ios::binary | std::ios::ate);
     if (in.is_open()) {
       file_size_ = in.tellg();
       in.close();
     }
-    LoadIndex();   // 从文件加载索引区
+    LoadIndexAndFilter();   // 从文件加载索引区
   }
 
   // 禁止拷贝（文件资源独占），允许移动
@@ -132,10 +147,15 @@ class SSTable {
   SSTable(SSTable &&) = default;
   SSTable &operator=(SSTable &&) = default;
 
-  // 点查询：通过索引找到偏移，读取值（跳过墓碑）
+  // 点查询：先用布隆过滤器快速判断，再查找索引并读取值
   bool Get(const K &key, V &value) const {
+
+    if(!bloom_filter_.MayContain(key))
+      return false;
+
     auto it = index_.find(key);
-    if (it == index_.end()) return false;
+    if (it == index_.end())
+      return false;
 
     uint64_t offset = it->second;          // 数据区偏移
 
@@ -147,7 +167,8 @@ class SSTable {
     K dummy_key;
     ReadBinary(in, dummy_key);             // 跳过键
 
-    if (tombstone) return false;           // 墓碑 → 不存在
+    if (tombstone)
+      return false;           // 墓碑 → 不存在
 
     ReadBinary(in, value);                 // 读取值
     return true;
@@ -165,34 +186,61 @@ class SSTable {
   std::string filename_;                   // 文件路径
   size_t file_size_;                       // 文件大小（字节）
   std::map<K, uint64_t> index_;            // 内存索引：键 → 数据偏移量
+  BloomFilter<K> bloom_filter_;
 
   // 从文件的索引区加载所有 (key, offset) 到 index_
-  void LoadIndex() {
+  void LoadIndexAndFilter() {
     std::ifstream in(filename_, std::ios::binary);
     if (!in.is_open()) {
       std::cerr << "Failed to open SSTable for index loading: " << filename_ << std::endl;
       return;
     }
 
-    // 1. 读取 Footer（最后8字节）
-    in.seekg(-8, std::ios::end);
-    uint64_t index_offset;
+    // 获取文件大小，确保至少 16 字节 Footer
+    in.seekg(0, std::ios::end);
+    size_t file_size = in.tellg();
+    if (file_size < 16) {
+      std::cerr << "SSTable file too small: " << filename_ << std::endl;
+      return;
+    }
+
+    // 1. 读取 Footer（最后 16 字节）
+    in.seekg(-16, std::ios::end);
+    uint64_t index_offset, bloom_offset;
     ReadBinary(in, index_offset);
+    ReadBinary(in, bloom_offset);
 
-    // 2. 跳转到索引区
+    // 2. 加载索引区
+    if (index_offset >= file_size) {
+      std::cerr << "Invalid index offset in " << filename_ << std::endl;
+      return;
+    }
     in.seekg(index_offset, std::ios::beg);
-
-    // 3. 读取条目数
     uint32_t index_size;
     ReadBinary(in, index_size);
-
-    // 4. 逐条读入
     for (uint32_t i = 0; i < index_size; ++i) {
       K key;
       ReadBinary(in, key);
       uint64_t offset;
       ReadBinary(in, offset);
       index_[key] = offset;
+    }
+
+    // 3. 加载布隆过滤器（如果存在）
+    if (bloom_offset != 0 && bloom_offset < file_size) {
+      in.seekg(bloom_offset, std::ios::beg);
+      uint32_t filter_size;
+      ReadBinary(in, filter_size);
+      std::string filter_data(filter_size, '\0');
+      if (!in.read(&filter_data[0], filter_size)) {
+        std::cerr << "Failed to read bloom filter data from " << filename_ << std::endl;
+        bloom_filter_ = BloomFilter<K>(10, 1000);  // fallback
+      } else {
+        bloom_filter_ = BloomFilter<K>::Deserialize(filter_data);
+      }
+    } else {
+      // 文件中没有布隆过滤器，构造一个默认的
+      bloom_filter_ = BloomFilter<K>(10, 1000);
     }
 
     if (!in) {
@@ -228,8 +276,8 @@ class SSTableManager {
     return tables_;
   }
 
-  std::vector<std::unique_ptr<SSTable<K, V>>>& GetTables(){return tables_;}
-  const std::vector<std::unique_ptr<SSTable<K, V>>>& GetTables()const{return tables_;}
+  std::vector<std::unique_ptr<SSTable<K, V>>> &GetTables() { return tables_; }
+  const std::vector<std::unique_ptr<SSTable<K, V>>> &GetTables() const { return tables_; }
  private:
   // 按加入顺序保存（旧→新），查询时逆序
   std::vector<std::unique_ptr<SSTable<K, V>>> tables_;

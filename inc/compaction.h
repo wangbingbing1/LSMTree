@@ -41,6 +41,13 @@ static bool ReadAllEntries(const std::string &filename,
   uint64_t index_offset;
   ReadBinary(in, index_offset);
 
+  if (file_size >= 16) {
+    in.seekg(-16, std::ios::end);
+    ReadBinary(in, index_offset);
+    uint64_t bloom_offset;
+    ReadBinary(in, bloom_offset);
+  }
+
   // 2. 跳转到索引区，读取索引条目数
   in.seekg(index_offset, std::ios::beg);
   uint32_t index_size;
@@ -118,8 +125,8 @@ void CompactSSTable(SSTableManager<K, V> &sst_manager,
 
   // 用于构建最小堆
   auto cmp = [&](size_t i, size_t j) {
-    const auto& ei = all_entries[i][ptrs[i]];
-    const auto& ej = all_entries[j][ptrs[j]];
+    const auto &ei = all_entries[i][ptrs[i]];
+    const auto &ej = all_entries[j][ptrs[j]];
     // 先按 key 升序：key 更小的优先
     if (std::get<0>(ei) != std::get<0>(ej))
       return std::get<0>(ei) > std::get<0>(ej);
@@ -140,7 +147,7 @@ void CompactSSTable(SSTableManager<K, V> &sst_manager,
     // 弹出堆顶：当前所有文件中键最小且版本最新的一条记录
     size_t idx = pq.top();
     pq.pop();
-    const auto& entry = all_entries[idx][ptrs[idx]];
+    const auto &entry = all_entries[idx][ptrs[idx]];
     K key = std::get<0>(entry);
     bool first_is_tombstone = std::get<2>(entry);   // 最新版本是否为墓碑
     V first_value = std::get<1>(entry);             // 最新版本的值
@@ -153,7 +160,7 @@ void CompactSSTable(SSTableManager<K, V> &sst_manager,
     // 跳过所有与该键相同的旧版本记录（它们在堆中连续排列）
     while (!pq.empty()) {
       size_t next_idx = pq.top();
-      const auto& next_entry = all_entries[next_idx][ptrs[next_idx]];
+      const auto &next_entry = all_entries[next_idx][ptrs[next_idx]];
       if (std::get<0>(next_entry) != key)
         break;   // 遇到不同的键，停止
       // 相同键的旧版本：弹出并推进指针，直接丢弃
@@ -180,7 +187,7 @@ void CompactSSTable(SSTableManager<K, V> &sst_manager,
   }
 
   // ---------- 4. 删除旧 SSTable 文件 ----------
-  for (const auto& sst : tables) {
+  for (const auto &sst : tables) {
     std::error_code ec;
     fs::remove(sst->Filename(), ec);
     if (ec) std::cerr << "[Compaction] Failed to remove " << sst->Filename() << "\n";
@@ -192,6 +199,103 @@ void CompactSSTable(SSTableManager<K, V> &sst_manager,
 
   std::cout << "[Compaction] Completed, new file: " << new_filename
             << ", entries: " << output.size() << "\n";
+}
+
+/**
+ * @tparam K        键类型
+ * @tparam V        值类型
+ * @param sources   多个有序数据源（每个源必须按键升序）
+ * @param start     范围起始键（包含）
+ * @param end       范围结束键（包含）
+ * @param output    输出回调，接受 (key, value)
+ */
+template<typename K, typename V>
+void MergeAndScan(
+    const std::vector<const std::vector<std::tuple<K, V, bool>>*> &sources,
+    const K &start,
+    const K &end,
+    std::function<void(const K &, const V &)> output) {
+
+  // ptrs[i] 记录第 i 个源当前待处理的元素下标
+  std::vector<size_t> ptrs(sources.size(), 0);
+
+  // 比较器：决定堆中哪个元素优先弹出（实现最小堆）
+  auto cmp = [&](size_t i, size_t j) {
+    const auto &ei = (*sources[i])[ptrs[i]];
+    const auto &ej = (*sources[j])[ptrs[j]];
+    const K &key_i = std::get<0>(ei);
+    const K &key_j = std::get<0>(ej);
+    // 键小的优先
+    if (key_i != key_j) return key_i > key_j;
+    // 键相同时，索引大的（更新）优先弹出
+    return i < j;   // i < j 时 i 优先级低，因此 j 更优先
+  };
+
+  // 优先队列存储源索引，按照 cmp 规则排序
+  std::priority_queue<size_t, std::vector<size_t>, decltype(cmp)> pq(cmp);
+
+  // 初始化：将每个源中第一个 >= start 的元素入堆（跳过所有小于 start 的）
+  for (size_t i = 0; i < sources.size(); ++i) {
+    auto &vec = *sources[i];
+    size_t &p = ptrs[i];
+    // 跳过所有 key < start 的记录
+    while (p < vec.size() && std::get<0>(vec[p]) < start) ++p;
+    // 如果还有剩余记录，且 key <= end（可在此处过滤，提高效率）
+    if (p < vec.size() && std::get<0>(vec[p]) <= end)
+      pq.push(i);
+  }
+
+  K current_key;
+  V current_value;
+  bool current_tomb = false;
+  bool has_current = false;   // 是否暂存了当前正在处理的键的最新版本
+
+  while (!pq.empty()) {
+    size_t idx = pq.top();
+    pq.pop();
+    auto &vec = *sources[idx];
+    size_t &p = ptrs[idx];
+    const auto &entry = vec[p];
+    K key = std::get<0>(entry);
+    V value = std::get<1>(entry);
+    bool tomb = std::get<2>(entry);
+
+    // 如果当前弹出的键已经超出范围，由于所有源有序，后续键都会更大，直接结束
+    if (key > end) break;
+
+    // 推进该源的指针，并决定是否重新入堆（下一个键必须在范围内）
+    ++p;
+    if (p < vec.size() && std::get<0>(vec[p]) <= end) {
+      pq.push(idx);
+    }
+
+    // 合并逻辑：处理同键的多个版本
+    if (!has_current) {
+      // 第一个遇到的键，直接暂存
+      current_key = key;
+      current_value = value;
+      current_tomb = tomb;
+      has_current = true;
+    } else if (key == current_key) {
+      // 相同键：用新版本覆盖（旧版本被丢弃）
+      current_value = value;      // current_key = value
+      current_tomb = tomb;
+    } else {
+      // 新键：先输出上一个键（如果非墓碑且未超出范围）
+      if (!current_tomb && current_key <= end) {
+        output(current_key, current_value);
+      }
+      // 暂存新键
+      current_key = key;
+      current_value = value;
+      current_tomb = tomb;
+    }
+  }
+
+  // 输出最后一个暂存的键（如果有效）
+  if (has_current && !current_tomb && current_key <= end) {
+    output(current_key, current_value);
+  }
 }
 
 #endif //TEST3_INC_COMPACTION_H_

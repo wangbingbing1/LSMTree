@@ -14,7 +14,6 @@
 #include <shared_mutex>
 #include <mutex>
 #include <tuple>
-#include <iostream>
 
 // ======================== WriteBatch ========================
 // 用于将多个写操作（PUT/DEL）打包成一个原子批次，
