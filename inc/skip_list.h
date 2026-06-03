@@ -14,6 +14,7 @@
 #include <shared_mutex>
 #include <mutex>
 #include <tuple>
+#include <memory>
 
 // ======================== WriteBatch ========================
 // 用于将多个写操作（PUT/DEL）打包成一个原子批次，
@@ -128,6 +129,50 @@ class SkipList {
   // 判断跳表中是否存在某个键（无论是否为墓碑）
   bool Contains(const K &key) const;
 
+  class Iterator {
+   public:
+    // 构造函数：获取读锁并保存起始节点
+    Iterator(const SkipList* list, Node* start) : list_(list),
+                                                  current_(start),
+                                                  lock_(std::make_unique<std::shared_lock<std::shared_mutex>>(list_->mutex_)) {};
+    // 如果起始节点为空，且锁已持有，仍然有效（但 Valid() 会返回 false）
+
+    // 转移锁的所有权
+    Iterator(Iterator &&other) noexcept: list_(other.list_),
+                                         current_(other.current_),
+                                         lock_(std::move(other.lock_)) {
+      other.current_ = nullptr;
+    }
+
+    // 禁止拷贝
+    Iterator(const Iterator &) = delete;
+    Iterator &operator=(const Iterator &) = delete;
+
+    Iterator &operator=(Iterator &&other) noexcept {
+      if(this!= &other){
+        list_ = other.list_;
+        current_ = other.current_;
+        lock_ = std::move(other.lock_);
+        other.current_ = nullptr;
+      }
+      return *this;
+    }
+
+    bool Valid() const { return current_ != nullptr; }
+    void Next() { if (current_)current_ = current_->forward[0]; }
+    const K &key() const { return current_->key; }
+    const V &Value() const { return current_->value; }
+    bool IsTombstone() const { return current_->is_tombstone; }
+   private:
+    const SkipList* list_;
+    Node* current_;
+    std::unique_ptr<std::shared_lock<std::shared_mutex>> lock_;
+  };
+
+  Iterator GetIterator() const {
+    return Iterator(this,head_->forward[0]);
+  }
+
  private:
   Node* head_;                              // 头节点（哨兵，不存有效数据）
   int max_level_;                           // 当前最大层数
@@ -142,7 +187,7 @@ class SkipList {
   // 内部不加锁的插入，支持设置墓碑标记
   void InsertUnlocked(const K &key, const V &value, bool tombstone);
 
-  // 内部不加锁的物理删除（⚠️ 已废弃，保留仅用于测试或特殊场景）
+  // 内部不加锁的物理删除（已废弃）
   bool RemoveUnlocked(const K &key);
 };
 
@@ -207,7 +252,7 @@ void SkipList<K, V>::InsertUnlocked(const K &key, const V &value, bool tombstone
   MaybeIncreaseLevel();
 }
 
-// 物理删除节点（已废弃，保留仅供参考）
+// 物理删除节点（已废弃）
 template<typename K, typename V>
 bool SkipList<K, V>::RemoveUnlocked(const K &key) {
   std::vector<Node*> update(max_level_ + 1, nullptr);

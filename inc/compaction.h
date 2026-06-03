@@ -129,9 +129,8 @@ void CompactSSTable(SSTableManager<K, V> &sst_manager,
     const auto &ej = all_entries[j][ptrs[j]];
     // 先按 key 升序：key 更小的优先
     if (std::get<0>(ei) != std::get<0>(ej))
-      return std::get<0>(ei) > std::get<0>(ej);
-    // key 相同时，文件索引大的优先弹出，索引小的优先级低
-    return i < j;
+      return std::get<0>(ei) > std::get<0>(ej); // key 大的优先级低 → 堆顶是 key 最小的
+    return i < j; // key 相同时，旧文件索引小，返回 true 表示优先级低 → 新文件先弹出
   };
   std::priority_queue<size_t, std::vector<size_t>, decltype(cmp)> pq(cmp);
 
@@ -239,7 +238,8 @@ void MergeAndScan(
     auto &vec = *sources[i];
     size_t &p = ptrs[i];
     // 跳过所有 key < start 的记录
-    while (p < vec.size() && std::get<0>(vec[p]) < start) ++p;
+    while (p < vec.size() && std::get<0>(vec[p]) < start)
+      ++p;
     // 如果还有剩余记录，且 key <= end（可在此处过滤，提高效率）
     if (p < vec.size() && std::get<0>(vec[p]) <= end)
       pq.push(i);

@@ -56,7 +56,7 @@ void AutoCheckpoint(SkipList<std::string, std::string> &db,
   }
 }
 
-void MaybeCompact(){
+void MaybeCompact() {
   if (g_sst_manager.GetTables().size() >= 4) {
     CompactSSTable(g_sst_manager, g_sst_dir);
   }
@@ -121,8 +121,7 @@ int main() {
         in_batch = true;
         std::cout << "Batch started.\n";
       }
-    }
-    else if (cmd == "commit") {
+    } else if (cmd == "commit") {
       if (!in_batch) {
         std::cout << "No active batch.\n";
       } else {
@@ -132,8 +131,7 @@ int main() {
         in_batch = false;
         std::cout << "Batch committed.\n";
       }
-    }
-    else if (cmd == "rollback") {
+    } else if (cmd == "rollback") {
       if (!in_batch) {
         std::cout << "No active batch.\n";
       } else {
@@ -199,28 +197,40 @@ int main() {
     else if (cmd == "scan") {
       std::string start, end;
       std::cin >> start >> end;
-      db.RangeQuery(start, end, [](const std::string &k, const std::string &v) {
+
+      // 收集所有MemTable中的记录
+      std::vector<std::tuple<std::string, std::string, bool>> mem_entries;
+      db.ForEachWithTombstone([&mem_entries](const std::string &k, const std::string &v, bool tomb) {
+        mem_entries.emplace_back(k, v, tomb);
+      });
+
+      // 收集所有SSTable中的记录
+      std::vector<std::vector<std::tuple<std::string, std::string, bool>>> sst_entries_lise;
+      for (const auto &sst : g_sst_manager.GetALL()) {
+        std::vector<std::tuple<std::string, std::string, bool>> entries;
+        if (ReadAllEntries(sst->Filename(), entries)) {
+          sst_entries_lise.push_back(std::move(entries));
+        } else {
+          std::cerr << "Failed to read SSTable: " << sst->Filename() << std::endl;
+        }
+      }
+
+      // 构建数据源指针列(MemTable在前,然后各个 SSTable)
+      std::vector<const std::vector<std::tuple<std::string, std::string, bool>>*> sources;
+      sources.push_back(&mem_entries);
+      for (const auto &entries : sst_entries_lise) {
+        sources.push_back(&entries);
+      }
+
+      MergeAndScan<std::string, std::string>(sources, start, end, [](const std::string& k, const std::string& v) {
         std::cout << k << " : " << v << "\n";
       });
-      std::cout << "(Note: scan only covers memtable, not SSTables)\n";
-    }
 
-      // --- 强制 Flush ---
-    else if (cmd == "flush") {
-      if (in_batch) {
-        std::cout << "Cannot flush while in batch. Commit or rollback first.\n";
-        continue;
-      }
-      if (FlushMemTableToSSTable(db, wal, g_sst_dir, g_sst_manager)) {
-        MaybeCompact();
-        std::cout << "Flush successful.\n";
-      } else {
-        std::cout << "Flush failed.\n";
-      }
+      std::cout << "(Full range scan across MemTable and SSTables completed)\n";
     }
 
       // --- 保存（flush 的别名）---
-    else if (cmd == "save") {
+    else if (cmd == "save"||cmd=="flush") {
       if (in_batch) {
         std::cout << "Cannot save while in batch.\n";
         continue;

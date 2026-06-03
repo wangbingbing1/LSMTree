@@ -18,6 +18,7 @@
 
 #include "skip_list.h"
 #include "bloom_filter.h"
+#include "block_cache.h"
 
 namespace fs = std::filesystem;
 
@@ -115,23 +116,23 @@ class SSTable {
         filter.Add(std::get<0>(entry));
       }
     }
-    std::string filter_data=filter.Serialize();
+    std::string filter_data = filter.Serialize();
     uint64_t bloom_offset = out.tellp();
     uint32_t filter_size = static_cast<uint32_t>(filter_data.size());
-    WriteBinary(out,filter_size);
-    out.write(filter_data.data(),filter_size);
+    WriteBinary(out, filter_size);
+    out.write(filter_data.data(), filter_size);
 
     // 写入 Footer：索引区的起始偏移量（8字节）布隆过滤器偏移 (8字节)
     uint64_t index_offset = offset;
     WriteBinary(out, index_offset);
-    WriteBinary(out,bloom_offset);
+    WriteBinary(out, bloom_offset);
 
     out.close();
     return static_cast<bool>(out);
   }
 
   // 打开已有 SSTable 文件，加载索引到内存
-  explicit SSTable(const std::string &filename) : filename_(filename), file_size_(0),bloom_filter_(10,1000) {
+  explicit SSTable(const std::string &filename) : filename_(filename), file_size_(0), bloom_filter_(10, 1000) {
     // 获取文件大小
     std::ifstream in(filename, std::ios::binary | std::ios::ate);
     if (in.is_open()) {
@@ -150,7 +151,10 @@ class SSTable {
   // 点查询：先用布隆过滤器快速判断，再查找索引并读取值
   bool Get(const K &key, V &value) const {
 
-    if(!bloom_filter_.MayContain(key))
+    // 所有SSTable共享cache 容量为64MB
+    static BlockCache<V> cache(64 * 1024 * 1024);
+
+    if (!bloom_filter_.MayContain(key))
       return false;
 
     auto it = index_.find(key);
@@ -159,6 +163,13 @@ class SSTable {
 
     uint64_t offset = it->second;          // 数据区偏移
 
+    std::string cache_key = filename_ + ":" + std::to_string(offset);
+
+    if (cache.Lookup(cache_key, value)) {
+      return true; // 命中
+    }
+
+    // 缓存未命中 读盘
     std::ifstream in(filename_, std::ios::binary);
     if (!in.is_open()) return false;
 
@@ -171,6 +182,7 @@ class SSTable {
       return false;           // 墓碑 → 不存在
 
     ReadBinary(in, value);                 // 读取值
+    cache.Insert(cache_key, value);  // 写入缓存
     return true;
   }
 
@@ -182,11 +194,40 @@ class SSTable {
   size_t FileSize() const { return file_size_; }
   const std::string &Filename() const { return filename_; }
 
+  class Iterator {
+   public:
+    Iterator(std::ifstream &&stream, uint64_t data_end_offset);
+    ~Iterator();
+
+    bool Valid() const { return valid_; }
+    void Next();
+    const K &Key() const { return key_; }
+    const V &Value() const { return value_; }
+    bool IsTombstone() const { return tombstone_; }
+
+   private:
+    std::ifstream file_;
+    uint64_t data_end_offset_;
+    uint64_t current_offset_;
+    bool valid_;
+    K key_;
+    V value_;
+    bool tombstone_;
+
+    bool ReadNext();
+  };
+  Iterator NewIterator() const {
+    std::ifstream in(filename_, std::ios::binary);
+    if (!in.is_open())
+      return Iterator(std::move(in), 0);
+    return Iterator(std::move(in), index_offset_);
+  }
  private:
   std::string filename_;                   // 文件路径
   size_t file_size_;                       // 文件大小（字节）
   std::map<K, uint64_t> index_;            // 内存索引：键 → 数据偏移量
   BloomFilter<K> bloom_filter_;
+  uint64_t index_offset_;                   //  数据区偏移索引
 
   // 从文件的索引区加载所有 (key, offset) 到 index_
   void LoadIndexAndFilter() {
@@ -282,6 +323,85 @@ class SSTableManager {
   // 按加入顺序保存（旧→新），查询时逆序
   std::vector<std::unique_ptr<SSTable<K, V>>> tables_;
 };
+
+// ======================== SSTable::Iterator ========================
+template<typename K, typename V>
+SSTable<K, V>::Iterator::Iterator(std::ifstream &&stream, uint64_t data_end_offset):
+    file_(std::move(stream)),
+    data_end_offset_(data_end_offset),
+    current_offset_(0),
+    valid_(false) {
+  if (file_.is_open()) {
+    file_.seekg(0, std::ios::beg);
+    valid_ = ReadNext();
+  }
+}
+
+template<typename K, typename V>
+SSTable<K, V>::Iterator::~Iterator() = default;
+
+/**
+ * 从 SSTable 数据区的当前位置读取下一条记录，并更新迭代器的状态。
+ *
+ * 一条记录在数据区的格式：
+ *   [1 字节 flags] [key（变长序列化）] [value（仅当非墓碑时存在，变长序列化）]
+ *
+ * 该函数会读取并解析这些字段，然后更新 key_、value_、tombstone_，
+ * 同时将 current_offset_ 移动到下一条记录的起始位置。
+ *
+ * @return true 如果成功读取一条记录，false 表示已到数据区末尾或发生读取错误。
+ */
+template<typename K, typename V>
+bool SSTable<K, V>::Iterator::ReadNext() {
+  // 文件未打开，无法读取
+  if (!file_.is_open())
+    return false;
+
+  // 已经到达或超过数据区结束偏移，无更多记录
+  if (current_offset_ >= data_end_offset_)
+    return false;
+
+  // 定位到当前记录的起始位置
+  file_.seekg(current_offset_, std::ios::beg);
+
+  // seekg 后流可能处于异常状态（如 EOF 或 fail）
+  if (file_.eof() || file_.fail())
+    return false;
+
+  // 1. 读取 1 字节的墓碑标记
+  uint8_t flags;
+  ReadBinary(file_, flags);          // ReadBinary 读取单个 uint8_t
+  bool tomb = (flags & 1) != 0;      // 位 0 为 1 表示墓碑
+
+  // 2. 读取键（变长序列化，内部有长度前缀）
+  K k;
+  ReadBinary(file_, k);
+
+  // 3. 读取值（仅当非墓碑时才存在）
+  V v{};
+  if (!tomb) {
+    ReadBinary(file_, v);
+  }
+
+  // 4. 更新当前偏移量到这条记录之后（即下一条记录的开始位置）
+  current_offset_ = file_.tellg();
+  if (file_.fail())
+    return false;                  // 获取偏移失败，返回 false
+
+  // 5. 将读到的数据保存到迭代器成员中（通过移动语义，避免拷贝）
+  key_ = std::move(k);
+  value_ = std::move(v);
+  tombstone_ = tomb;
+
+  return true;
+}
+
+template<typename K,typename V>
+void SSTable<K,V>::Iterator::Next() {
+  if(!valid_)
+    return;
+  valid_=ReadNext();
+}
 
 // ======================== 辅助函数 ========================
 

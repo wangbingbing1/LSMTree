@@ -126,6 +126,9 @@ class BloomFilter {
 
     BloomFilter filter(10, 1000);   // 占位构造
     filter.k_ = k;                  // 覆盖为正确的 k_
+    if (filter.k_ < 1) filter.k_ = 1;
+    if (filter.k_ > 30) filter.k_ = 30;
+
     filter.bits_.resize(bit_len);   // 调整位数组为正确长度
 
     // 5. 逐位还原 bits_ 的内容
