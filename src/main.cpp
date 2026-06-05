@@ -11,6 +11,7 @@
 #include "skip_list.h"
 #include "sstable.h"
 #include "compaction.h"
+#include "merging_iterator.h"
 
 using KVStore = SkipList<std::string, std::string>;
 using SSTableManagerType = SSTableManager<std::string, std::string>;
@@ -193,44 +194,47 @@ int main() {
       }
     }
 
-      // --- 范围扫描（当前仅覆盖 MemTable）---
+      // --- 范围扫描---
     else if (cmd == "scan") {
       std::string start, end;
       std::cin >> start >> end;
 
-      // 收集所有MemTable中的记录
-      std::vector<std::tuple<std::string, std::string, bool>> mem_entries;
-      db.ForEachWithTombstone([&mem_entries](const std::string &k, const std::string &v, bool tomb) {
-        mem_entries.emplace_back(k, v, tomb);
-      });
+      // 构建迭代器列表：MemTable 在前（最新），SSTable 从新到旧（逆序）
+      std::vector<std::unique_ptr<IteratorInterface<std::string, std::string>>> iters;
 
-      // 收集所有SSTable中的记录
-      std::vector<std::vector<std::tuple<std::string, std::string, bool>>> sst_entries_lise;
-      for (const auto &sst : g_sst_manager.GetALL()) {
-        std::vector<std::tuple<std::string, std::string, bool>> entries;
-        if (ReadAllEntries(sst->Filename(), entries)) {
-          sst_entries_lise.push_back(std::move(entries));
-        } else {
-          std::cerr << "Failed to read SSTable: " << sst->Filename() << std::endl;
+      // 1. MemTable 迭代器
+      auto mem_iter = db.GetIterator();
+      iters.push_back(std::make_unique<SkipListIteratorWrapper<std::string, std::string>>(std::move(mem_iter)));
+
+      const auto &tables = g_sst_manager.GetALL();
+      for (auto it = tables.rbegin(); it != tables.rend(); ++it) {
+        auto sst_iter = (*it)->NewIterator(); // 返回SSTable::Iterator
+        if (sst_iter.Valid()) {
+          iters.push_back(std::make_unique<SSTableIteratorWrapper<std::string, std::string>>(std::move(sst_iter)));
         }
       }
 
-      // 构建数据源指针列(MemTable在前,然后各个 SSTable)
-      std::vector<const std::vector<std::tuple<std::string, std::string, bool>>*> sources;
-      sources.push_back(&mem_entries);
-      for (const auto &entries : sst_entries_lise) {
-        sources.push_back(&entries);
+      // 创建归并迭代器
+      MergingIterator<std::string, std::string> merge_iter(std::move(iters));
+
+      // 定位到start
+      while (merge_iter.Valid() && merge_iter.Key() < start) {
+        merge_iter.Next();
       }
 
-      MergeAndScan<std::string, std::string>(sources, start, end, [](const std::string& k, const std::string& v) {
-        std::cout << k << " : " << v << "\n";
-      });
-
-      std::cout << "(Full range scan across MemTable and SSTables completed)\n";
+      bool has_output = false;
+      while (merge_iter.Valid() && merge_iter.Key() <= end) {
+        std::cout << merge_iter.Key() << ":" << merge_iter.Value() << std::endl;
+        has_output = true;
+        merge_iter.Next();
+      }
+      if (!has_output) {
+        std::cout << "No keys in range [" << start << ", " << end << "]\n";
+      }
     }
 
       // --- 保存（flush 的别名）---
-    else if (cmd == "save"||cmd=="flush") {
+    else if (cmd == "save" || cmd == "flush") {
       if (in_batch) {
         std::cout << "Cannot save while in batch.\n";
         continue;

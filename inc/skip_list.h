@@ -148,6 +148,7 @@ class SkipList {
     Iterator(const Iterator &) = delete;
     Iterator &operator=(const Iterator &) = delete;
 
+    // 移动语义
     Iterator &operator=(Iterator &&other) noexcept {
       if(this!= &other){
         list_ = other.list_;
@@ -160,7 +161,7 @@ class SkipList {
 
     bool Valid() const { return current_ != nullptr; }
     void Next() { if (current_)current_ = current_->forward[0]; }
-    const K &key() const { return current_->key; }
+    const K &Key() const { return current_->key; }
     const V &Value() const { return current_->value; }
     bool IsTombstone() const { return current_->is_tombstone; }
    private:

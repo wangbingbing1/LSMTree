@@ -132,7 +132,7 @@ class SSTable {
   }
 
   // 打开已有 SSTable 文件，加载索引到内存
-  explicit SSTable(const std::string &filename) : filename_(filename), file_size_(0), bloom_filter_(10, 1000) {
+  explicit SSTable(const std::string &filename) : filename_(filename), file_size_(0), bloom_filter_(10, 1000),index_offset_(0) {
     // 获取文件大小
     std::ifstream in(filename, std::ios::binary | std::ios::ate);
     if (in.is_open()) {
@@ -196,8 +196,15 @@ class SSTable {
 
   class Iterator {
    public:
+    // 构造函数：接受文件流右值和数据区结束偏移
     Iterator(std::ifstream &&stream, uint64_t data_end_offset);
     ~Iterator();
+
+    Iterator(Iterator&&) = default;
+    Iterator& operator=(Iterator&&) = default;
+
+    Iterator(const Iterator&) = delete;
+    Iterator& operator=(const Iterator&) = delete;
 
     bool Valid() const { return valid_; }
     void Next();
@@ -214,7 +221,7 @@ class SSTable {
     V value_;
     bool tombstone_;
 
-    bool ReadNext();
+    bool ReadNext();// 读取下一条记录，返回是否成功
   };
   Iterator NewIterator() const {
     std::ifstream in(filename_, std::ios::binary);
@@ -250,6 +257,8 @@ class SSTable {
     uint64_t index_offset, bloom_offset;
     ReadBinary(in, index_offset);
     ReadBinary(in, bloom_offset);
+
+    index_offset_ = index_offset;
 
     // 2. 加载索引区
     if (index_offset >= file_size) {

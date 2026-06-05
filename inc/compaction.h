@@ -16,6 +16,7 @@
 #include <tuple>
 
 #include "sstable.h"
+#include "merging_iterator.h"
 
 namespace fs = std::filesystem;
 
@@ -90,7 +91,7 @@ static bool ReadAllEntries(const std::string &filename,
 
 /**
  * 合并 SSTableManager 中的所有 SSTable 文件为一个新的 SSTable。
- * 实现方式：多路归并（最小堆），每个键的旧版本在弹出后立即丢弃。
+ * 利用 MergingIterator 多路归并，自动去重、跳过墓碑，仅保留有效键值对。
  *
  * @param sst_manager  SSTable 管理器，合并后内部状态被刷新（清空旧表，加载新表）
  * @param sst_dir      SSTable 文件存储目录
@@ -98,86 +99,41 @@ static bool ReadAllEntries(const std::string &filename,
 template<typename K, typename V>
 void CompactSSTable(SSTableManager<K, V> &sst_manager,
                     const std::string &sst_dir) {
-  // 获取当前所有 SSTable 的引用（假设 SSTableManager 提供 GetALL() 返回 vector）
+  // 获取当前所有 SSTable 的引用（假设 SSTableManager 提供 GetTables() 返回 vector）
   const auto &tables = sst_manager.GetTables();
   if (tables.size() <= 1) return;   // 少于两个文件无需合并
 
   std::cout << "[Compaction] Starting compaction of " << tables.size() << " files...\n";
 
-  // ---------- 1. 读取所有 SSTable 的全部记录 ----------
-  // all_entries[i] 保存第 i 个文件的全部记录 (key, value, is_tombstone)
-  // 文件索引 i 越大，文件越新（因为加载顺序由旧到新，下标递增代表新旧顺序）
-  std::vector<std::vector<std::tuple<K, V, bool>>> all_entries;
-  all_entries.reserve(tables.size());
-  for (size_t i = 0; i < tables.size(); ++i) {
-    std::vector<std::tuple<K, V, bool>> entries;
-    // ReadAllEntries 从 SSTable 文件中读出所有记录
-    if (!ReadAllEntries<K, V>(tables[i]->Filename(), entries)) {
-      std::cerr << "[Compaction] Failed to read " << tables[i]->Filename() << ", abort.\n";
-      return;
+  // ----- 1. 构建归并迭代器（从新到旧，保证最新数据优先）-----
+  std::vector<std::unique_ptr<IteratorInterface<K, V>>> iters;
+  // 逆序遍历 tables：最新生成的 SSTable 索引最大（尾部），先加入迭代器列表
+  for (auto it = tables.rbegin(); it != tables.rend(); ++it) {
+    auto sst_iter = (*it)->NewIterator();
+    if (sst_iter.Valid()) {
+      // 将原生迭代器适配为统一的 IteratorInterface，并移入列表
+      iters.push_back(std::make_unique<SSTableIteratorWrapper<K, V>>(std::move(sst_iter)));
     }
-    all_entries.push_back(std::move(entries));
   }
 
-  // ---------- 2. 多路归并（最小堆） ----------
-  // ptrs[i] 表示第 i 个文件当前待处理的记录下标
-  std::vector<size_t> ptrs(all_entries.size(), 0);
+  // MergingIterator 自动进行多路归并：最小堆、同键保留最新、跳过墓碑
+  MergingIterator<K, V> merge_iter(std::move(iters));
 
-  // 用于构建最小堆
-  auto cmp = [&](size_t i, size_t j) {
-    const auto &ei = all_entries[i][ptrs[i]];
-    const auto &ej = all_entries[j][ptrs[j]];
-    // 先按 key 升序：key 更小的优先
-    if (std::get<0>(ei) != std::get<0>(ej))
-      return std::get<0>(ei) > std::get<0>(ej); // key 大的优先级低 → 堆顶是 key 最小的
-    return i < j; // key 相同时，旧文件索引小，返回 true 表示优先级低 → 新文件先弹出
-  };
-  std::priority_queue<size_t, std::vector<size_t>, decltype(cmp)> pq(cmp);
-
-  // 初始化堆：将每个文件的第一条记录加入堆
-  for (size_t i = 0; i < all_entries.size(); ++i) {
-    if (ptrs[i] < all_entries[i].size())
-      pq.push(i);
+  // ----- 2. 收集合并后的有效记录（全部为非墓碑）-----
+  std::vector<std::tuple<K, V, bool>> output;
+  while (merge_iter.Valid()) {
+    // 由于 MergingIterator 已跳过所有墓碑，此处墓碑标记固定为 false
+    output.emplace_back(merge_iter.Key(), merge_iter.Value(), false);
+    merge_iter.Next();
   }
 
-  std::vector<std::tuple<K, V, bool>> output;   // 最终写入新 SSTable 的记录
-
-  while (!pq.empty()) {
-    // 弹出堆顶：当前所有文件中键最小且版本最新的一条记录
-    size_t idx = pq.top();
-    pq.pop();
-    const auto &entry = all_entries[idx][ptrs[idx]];
-    K key = std::get<0>(entry);
-    bool first_is_tombstone = std::get<2>(entry);   // 最新版本是否为墓碑
-    V first_value = std::get<1>(entry);             // 最新版本的值
-
-    // 推进该文件的指针，如果还有数据则重新入堆
-    ptrs[idx]++;
-    if (ptrs[idx] < all_entries[idx].size())
-      pq.push(idx);
-
-    // 跳过所有与该键相同的旧版本记录（它们在堆中连续排列）
-    while (!pq.empty()) {
-      size_t next_idx = pq.top();
-      const auto &next_entry = all_entries[next_idx][ptrs[next_idx]];
-      if (std::get<0>(next_entry) != key)
-        break;   // 遇到不同的键，停止
-      // 相同键的旧版本：弹出并推进指针，直接丢弃
-      pq.pop();
-      ptrs[next_idx]++;
-      if (ptrs[next_idx] < all_entries[next_idx].size())
-        pq.push(next_idx);
-    }
-
-    // 根据最新版本决定是否保留该键
-    if (first_is_tombstone)
-      continue;   // 最新版本是墓碑，键已被删除，不加入输出
-
-    // 最新版本是有效值，保留
-    output.emplace_back(key, first_value, false);
+  // 若合并后没有任何有效记录，则直接退出（不生成空文件）
+  if (output.empty()) {
+    std::cout << "[Compaction] No valid entries after merge, skipping.\n";
+    return;
   }
 
-  // ---------- 3. 生成新的 SSTable 文件 ----------
+  // ----- 3. 生成新的 SSTable 文件 -----
   int new_num = GetNextSSTableNumber(sst_dir);
   std::string new_filename = sst_dir + "/" + std::to_string(new_num) + ".sst";
   if (!SSTable<K, V>::Build(new_filename, output)) {
@@ -185,16 +141,19 @@ void CompactSSTable(SSTableManager<K, V> &sst_manager,
     return;
   }
 
-  // ---------- 4. 删除旧 SSTable 文件 ----------
+  // ----- 4. 删除所有旧的 SSTable 文件 -----
   for (const auto &sst : tables) {
     std::error_code ec;
     fs::remove(sst->Filename(), ec);
-    if (ec) std::cerr << "[Compaction] Failed to remove " << sst->Filename() << "\n";
+    if (ec) {
+      std::cerr << "[Compaction] Failed to remove " << sst->Filename() << ": "
+                << ec.message() << "\n";
+    }
   }
 
-  // ---------- 5. 刷新管理器 ----------
-  sst_manager.Clear();                        // 清空管理器中的旧 SSTable 对象
-  LoadSSTableFromDir(sst_dir, sst_manager);  // 重新加载目录中的 SSTable（此时只有新文件）
+  // ----- 5. 刷新管理器并重新加载（只包含新生成的文件）-----
+  sst_manager.Clear();
+  LoadSSTableFromDir(sst_dir, sst_manager);
 
   std::cout << "[Compaction] Completed, new file: " << new_filename
             << ", entries: " << output.size() << "\n";
