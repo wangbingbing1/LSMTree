@@ -27,6 +27,11 @@ class BloomFilter {
     if (bits < 64) bits = 64;
     bits_.resize(bits);
 
+    if (expected_keys == 0) {
+      bits_.resize(64);
+      k_ = 1;
+      return;
+    }
     // 根据推导出的最优哈希函数个数公式：
     // k = (bits / n) * ln(2) ≈ ratio * 0.693
     double ratio = static_cast<double>(bits) / expected_keys;

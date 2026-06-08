@@ -35,19 +35,13 @@ static bool ReadAllEntries(const std::string &filename,
   // 获取文件总大小
   in.seekg(0, std::ios::end);
   uint64_t file_size = in.tellg();
-  if (file_size < 8) return false;               // 文件至少需要包含 8 字节 Footer
+  if (file_size < 16) return false;               // 文件至少需要包含 16 字节 Footer
 
-  // 1. 读取 Footer（最后 8 字节）获得索引区起始偏移量
-  in.seekg(-8, std::ios::end);
-  uint64_t index_offset;
+  // 1. 读取 Footer（最后 16 字节）获得索引区起始偏移量
+  in.seekg(-16, std::ios::end);
+  uint64_t index_offset, bloom_offset;
   ReadBinary(in, index_offset);
-
-  if (file_size >= 16) {
-    in.seekg(-16, std::ios::end);
-    ReadBinary(in, index_offset);
-    uint64_t bloom_offset;
-    ReadBinary(in, bloom_offset);
-  }
+  ReadBinary(in, bloom_offset);
 
   // 2. 跳转到索引区，读取索引条目数
   in.seekg(index_offset, std::ios::beg);

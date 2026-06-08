@@ -19,52 +19,9 @@
 #include "skip_list.h"
 #include "bloom_filter.h"
 #include "block_cache.h"
+#include "binary_io.h"
 
 namespace fs = std::filesystem;
-
-// ======================== 二进制序列化工具 ========================
-
-// 通用 POD 类型写入（如 int, uint64_t）
-template<typename T>
-typename std::enable_if<std::is_pod<T>::value>::type
-WriteBinary(std::ostream &os, const T &value) {
-  os.write(reinterpret_cast<const char*>(&value), sizeof(T));
-}
-
-// 通用 POD 类型读取
-template<typename T>
-typename std::enable_if<std::is_pod<T>::value>::type
-ReadBinary(std::istream &is, T &value) {
-  is.read(reinterpret_cast<char*>(&value), sizeof(T));
-}
-
-// std::string 特化：先写 4 字节长度，再写字符数据
-inline void WriteBinary(std::ostream &os, const std::string &str) {
-  uint32_t len = static_cast<uint32_t>(str.size());
-  WriteBinary(os, len);            // 写入长度
-  os.write(str.data(), len);       // 写入内容
-}
-
-// std::string 特化：先读长度，再读指定字节
-inline void ReadBinary(std::istream &is, std::string &str) {
-  uint32_t len;
-  ReadBinary(is, len);
-  str.resize(len);
-  is.read(&str[0], len);
-}
-
-// 写入 1 字节的墓碑标记（0=正常，1=墓碑）
-inline void WriteFlags(std::ostream &os, bool is_tombstone) {
-  uint8_t flags = is_tombstone ? 1 : 0;
-  WriteBinary(os, flags);
-}
-
-// 读取 1 字节标记并解析为布尔值
-inline bool ReadFlags(std::istream &is) {
-  uint8_t flags;
-  ReadBinary(is, flags);
-  return (flags & 1) != 0;
-}
 
 // ======================== SSTable ========================
 template<typename K, typename V>
@@ -132,7 +89,8 @@ class SSTable {
   }
 
   // 打开已有 SSTable 文件，加载索引到内存
-  explicit SSTable(const std::string &filename) : filename_(filename), file_size_(0), bloom_filter_(10, 1000),index_offset_(0) {
+  explicit SSTable(const std::string &filename)
+      : filename_(filename), file_size_(0), bloom_filter_(10, 1000), index_offset_(0) {
     // 获取文件大小
     std::ifstream in(filename, std::ios::binary | std::ios::ate);
     if (in.is_open()) {
@@ -140,12 +98,34 @@ class SSTable {
       in.close();
     }
     LoadIndexAndFilter();   // 从文件加载索引区
+    file_stream_.open(filename_, std::ios::binary);
+    if (!file_stream_.is_open()) {
+      std::cerr << "Warning: failed to open SSTable file for caching: " << filename_ << std::endl;
+    }
+
+    if (!index_.empty()) {
+      first_key_ = index_.begin()->first;
+      last_key_ = index_.rbegin()->first;
+      has_keys_ = true;
+    }
   }
 
   // 禁止拷贝（文件资源独占），允许移动
   SSTable(const SSTable &) = delete;
   SSTable &operator=(const SSTable &) = delete;
-  SSTable(SSTable &&) = default;
+  SSTable(SSTable &&other) noexcept: filename_(other.filename_),
+                                     file_size_(other.file_size_),
+                                     index_(std::move(other.index_)),
+                                     bloom_filter_(std::move(other.bloom_filter_)),
+                                     index_offset_(other.index_offset_),
+                                     first_key_(std::move(other.first_key_)),
+                                     last_key_(std::move(other.last_key_)),
+                                     has_keys_(other.has_keys_),
+                                     file_stream_(std::move(other.file_stream_)) {
+    other.file_size_ = 0;
+    other.index_offset_ = 0;
+    other.has_keys_ = false;
+  }
   SSTable &operator=(SSTable &&) = default;
 
   // 点查询：先用布隆过滤器快速判断，再查找索引并读取值
@@ -169,19 +149,27 @@ class SSTable {
       return true; // 命中
     }
 
-    // 缓存未命中 读盘
-    std::ifstream in(filename_, std::ios::binary);
-    if (!in.is_open()) return false;
+    // 使用缓存的文件流
+    if (!file_stream_.is_open()) {
+      // 若流已关闭 重新打开
+      file_stream_.open(filename_, std::ios::binary);
+      if (!file_stream_.is_open())
+        return false;
+    }
+    // 清除错误状态并定位到偏移
+    file_stream_.clear();
+    file_stream_.seekg(offset, std::ios::beg);
+    if (file_stream_.fail())
+      return false;
 
-    in.seekg(offset, std::ios::beg);
-    bool tombstone = ReadFlags(in);        // 读取墓碑标记
+    bool tombstone = ReadFlags(file_stream_);        // 读取墓碑标记
     K dummy_key;
-    ReadBinary(in, dummy_key);             // 跳过键
+    ReadBinary(file_stream_, dummy_key);             // 跳过键
 
     if (tombstone)
       return false;           // 墓碑 → 不存在
 
-    ReadBinary(in, value);                 // 读取值
+    ReadBinary(file_stream_, value);                 // 读取值
     cache.Insert(cache_key, value);  // 写入缓存
     return true;
   }
@@ -200,11 +188,11 @@ class SSTable {
     Iterator(std::ifstream &&stream, uint64_t data_end_offset);
     ~Iterator();
 
-    Iterator(Iterator&&) = default;
-    Iterator& operator=(Iterator&&) = default;
+    Iterator(Iterator &&) = default;
+    Iterator &operator=(Iterator &&) = default;
 
-    Iterator(const Iterator&) = delete;
-    Iterator& operator=(const Iterator&) = delete;
+    Iterator(const Iterator &) = delete;
+    Iterator &operator=(const Iterator &) = delete;
 
     bool Valid() const { return valid_; }
     void Next();
@@ -223,18 +211,40 @@ class SSTable {
 
     bool ReadNext();// 读取下一条记录，返回是否成功
   };
+
+  bool GetFirstKey(K &key) const {
+    if (!has_keys_)return false;
+    key = first_key_;
+    return true;
+  }
+  bool GetLastKey(K &key) const {
+    if (!has_keys_)return false;
+    key = last_key_;
+    return true;
+  }
   Iterator NewIterator() const {
     std::ifstream in(filename_, std::ios::binary);
     if (!in.is_open())
       return Iterator(std::move(in), 0);
     return Iterator(std::move(in), index_offset_);
   }
+
+  void CloseFile(){
+    if(file_stream_.is_open()){
+      file_stream_.close();
+    }
+  }
+
  private:
   std::string filename_;                   // 文件路径
   size_t file_size_;                       // 文件大小（字节）
   std::map<K, uint64_t> index_;            // 内存索引：键 → 数据偏移量
   BloomFilter<K> bloom_filter_;
   uint64_t index_offset_;                   //  数据区偏移索引
+  K first_key_;
+  K last_key_;
+  bool has_keys_ = false;
+  mutable std::ifstream file_stream_;       // 可变的文件流，用于 Get 操作
 
   // 从文件的索引区加载所有 (key, offset) 到 index_
   void LoadIndexAndFilter() {
@@ -405,11 +415,11 @@ bool SSTable<K, V>::Iterator::ReadNext() {
   return true;
 }
 
-template<typename K,typename V>
-void SSTable<K,V>::Iterator::Next() {
-  if(!valid_)
+template<typename K, typename V>
+void SSTable<K, V>::Iterator::Next() {
+  if (!valid_)
     return;
-  valid_=ReadNext();
+  valid_ = ReadNext();
 }
 
 // ======================== 辅助函数 ========================

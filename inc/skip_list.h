@@ -16,6 +16,16 @@
 #include <tuple>
 #include <memory>
 
+#include "crc32.h"
+#include "binary_io.h"
+
+// 声明
+template<typename K, typename V>
+void WritePutToWAL(std::ostream& wal, const K& key, const V& value);
+
+template<typename K>
+void WriteDeleteToWAL(std::ostream& wal, const K& key);
+
 // ======================== WriteBatch ========================
 // 用于将多个写操作（PUT/DEL）打包成一个原子批次，
 // 在提交时统一写入 WAL 并应用到跳表。
@@ -23,6 +33,21 @@ template<typename K, typename V>
 class WriteBatch {
  public:
   enum kOpType { PUT, DEL };   // 操作类型
+
+  void SerializeToWAL(std::ostream &wal) const {
+    uint8_t begin_marker = 2;
+    wal.write(reinterpret_cast<const char*>(&begin_marker), 1);
+    for (const auto &op : ops_) {
+      if (op.type == PUT) {
+        WritePutToWAL(wal, op.key, op.value);
+      } else {
+        WriteDeleteToWAL(wal, op.key);
+      }
+    }
+    uint8_t commit_marker = 3;
+    wal.write(reinterpret_cast<const char*>(&commit_marker), 1);
+    wal.flush();
+  }
 
  private:
   struct Op {
@@ -93,6 +118,9 @@ class SkipList {
   // 批量应用 WriteBatch 中的操作，并先写 WAL
   void ApplyBatch(const WriteBatch<K, V> &batch, std::ostream &wal);
 
+  // 仅应用到内存表，不写 WAL
+  void ApplyBatchWithoutWAL(const WriteBatch<K, V> &batch);
+
   // 遍历所有非墓碑节点，按 key 升序，调用 func
   void ForEach(std::function<void(const K &, const V &)> func) const {
     std::shared_lock lock(mutex_);
@@ -150,7 +178,7 @@ class SkipList {
 
     // 移动语义
     Iterator &operator=(Iterator &&other) noexcept {
-      if(this!= &other){
+      if (this != &other) {
         list_ = other.list_;
         current_ = other.current_;
         lock_ = std::move(other.lock_);
@@ -171,7 +199,7 @@ class SkipList {
   };
 
   Iterator GetIterator() const {
-    return Iterator(this,head_->forward[0]);
+    return Iterator(this, head_->forward[0]);
   }
 
  private:
@@ -279,15 +307,7 @@ bool SkipList<K, V>::RemoveUnlocked(const K &key) {
 // 批量应用：先写 WAL，再应用到跳表
 template<typename K, typename V>
 void SkipList<K, V>::ApplyBatch(const WriteBatch<K, V> &batch, std::ostream &wal) {
-  // 将批次中所有操作写入 WAL
-  for (const auto &op : batch.GetOps()) {
-    if (op.type == WriteBatch<K, V>::PUT) {
-      wal << "PUT " << op.key << " " << op.value << "\n";
-    } else {
-      wal << "DEL " << op.key << "\n";
-    }
-  }
-  wal.flush();   // 强制落盘
+  batch.SerializeToWAL(wal);
 
   // 加锁后应用到内存表
   std::unique_lock lock(mutex_);
@@ -406,6 +426,68 @@ void SkipList<K, V>::Clear() {
     head_->forward[i] = nullptr;
   }
   size_ = 0;
+}
+
+template<typename K, typename V>
+void SkipList<K, V>::ApplyBatchWithoutWAL(const WriteBatch<K, V> &batch) {
+  std::unique_lock lock(mutex_);
+  for (const auto &op : batch.GetOps()) {
+    if (op.type == WriteBatch<K, V>::PUT) {
+      InsertUnlocked(op.key, op.value, false);
+    } else {
+      InsertUnlocked(op.key, V(), true);
+    }
+  }
+}
+
+// ======================== 辅助函数 ========================
+
+template<typename K, typename V>
+void WritePutToWAL(std::ostream &wal, const K &key, const V &value) {
+  static_assert(std::is_same<K, std::string>::value && std::is_same<V, std::string>::value,
+                "Only std::string supported");
+  uint8_t type = 0; // PUT
+  std::string buffer;
+  buffer.append(reinterpret_cast<const char*>(&type), 1);
+
+  // 写入 key
+  uint32_t key_len = static_cast<uint32_t>(key.size());
+  buffer.append(reinterpret_cast<const char*>(&key_len), 4);
+  buffer.append(key.data(), key_len);
+
+  // 写入 value
+  uint32_t value_len = static_cast<uint32_t>(value.size());
+  buffer.append(reinterpret_cast<const char*>(&value_len), 4);
+  buffer.append(value.data(), value_len);
+
+  // CRC
+  uint32_t crc = CRC32(buffer.data(), buffer.size());
+  buffer.append(reinterpret_cast<const char*>(&crc), 4);
+
+  wal.write(buffer.data(), buffer.size());
+}
+
+template<typename K>
+void WriteDeleteToWAL(std::ostream &wal, const K &key) {
+  static_assert(std::is_same<K, std::string>::value, "Only std::string supported");
+  uint8_t type = 1; // DELETE
+  std::string buffer;
+  buffer.append(reinterpret_cast<const char*>(&type), 1);
+
+  // 写入 key
+  uint32_t key_len = static_cast<uint32_t>(key.size());
+  buffer.append(reinterpret_cast<const char*>(&key_len), 4);
+  buffer.append(key.data(), key_len);
+
+  // 写入 value_len = 0（无 value 内容）
+  uint32_t value_len = 0;
+  buffer.append(reinterpret_cast<const char*>(&value_len), 4);
+
+  // CRC
+  uint32_t crc = CRC32(buffer.data(), buffer.size());
+  buffer.append(reinterpret_cast<const char*>(&crc), 4);
+
+  wal.write(buffer.data(), buffer.size());
 }
 
 #endif //TEST2_INCLUDE_SKIP_LIST_H_

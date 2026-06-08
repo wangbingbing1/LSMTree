@@ -78,42 +78,41 @@ class MergingIterator : public IteratorInterface<K, V> {
    * 每次调用会确保当前键为最新的非墓碑值；若为墓碑则自动跳过。
    */
   void Next() override {
-    if (heap_.empty()) {
-      valid_ = false;
+    while (!heap_.empty()) {
+      // 弹出堆顶（当前最小的键）
+      auto top = heap_.top();
+      heap_.pop();
+      size_t idx = top.idx;
+      current_key_ = top.key;
+      current_value_ = iters_[idx]->Value();
+      current_tombstone_ = iters_[idx]->IsTombstone();
+
+      // 推进该迭代器
+      iters_[idx]->Next();
+      if (iters_[idx]->Valid()) {
+        heap_.push({idx, iters_[idx]->Key()});
+      }
+
+      // 跳过堆中所有与当前键相同的旧版本（其他文件中的相同键）
+      while (!heap_.empty() && heap_.top().key == current_key_) {
+        auto &dup = heap_.top();
+        iters_[dup.idx]->Next();
+        heap_.pop();
+        if (iters_[dup.idx]->Valid()) {
+          heap_.push({dup.idx, iters_[dup.idx]->Key()});
+        }
+      }
+
+      // 如果当前键是墓碑，则继续循环找下一个键
+      if (current_tombstone_) {
+        continue;
+      }
+
+      // 找到有效键，退出循环
+      valid_ = true;
       return;
     }
-
-    // 1. 从最小堆中弹出全局最小的键同时处理同键的最新版本
-    auto top = heap_.top();
-    heap_.pop();
-    size_t idx = top.idx;
-    current_key_ = top.key;
-    // 读取最新版本的值和墓碑标记
-    current_value_ = iters_[idx]->Value();
-    current_tombstone_ = iters_[idx]->IsTombstone();
-
-    // 2. 推进被弹出的子迭代器，若仍有数据则重新入堆
-    iters_[idx]->Next();
-    if (iters_[idx]->Valid()) {
-      heap_.push({idx, iters_[idx]->Key()});
-    }
-
-    // 3. 跳过堆中所有与当前键相同的旧版本（旧文件中的同键记录）
-    while (!heap_.empty() && heap_.top().key == current_key_) {
-      auto &dup = heap_.top();
-      iters_[dup.idx]->Next();       // 推进旧版本的迭代器
-      heap_.pop();
-      if (iters_[dup.idx]->Valid()) {
-        heap_.push({dup.idx, iters_[dup.idx]->Key()});
-      }
-    }
-
-    // 4. 处理墓碑：如果最新版本是墓碑，则递归寻找下一个有效键
-    if (current_tombstone_) {
-      Next();           // 跳过当前键，继续尝试下一个
-    } else {
-      valid_ = true;    // 找到一个非墓碑的有效键
-    }
+    valid_ = false;
   }
 
   /**
