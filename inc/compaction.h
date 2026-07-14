@@ -17,6 +17,7 @@
 
 #include "sstable.h"
 #include "merging_iterator.h"
+#include "manifest.h"
 
 namespace fs = std::filesystem;
 

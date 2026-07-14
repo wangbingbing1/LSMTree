@@ -143,7 +143,7 @@ class MergingIterator : public IteratorInterface<K, V> {
     bool operator()(const HeapItem &a, const HeapItem &b) const {
       if (a.key != b.key)
         return a.key > b.key;
-      return a.idx < b.idx; // key 相同时，索引大的（新数据）优先级高
+      return a.idx > b.idx; // key 相同时，索引大的（新数据）优先级高
     }
   };
 

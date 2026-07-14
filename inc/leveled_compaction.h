@@ -17,17 +17,20 @@
 #include <unordered_set>
 #include <thread>
 #include <chrono>
+#include <atomic>
+#include <condition_variable>
 
 #include "sstable.h"
 #include "merging_iterator.h"
 #include "compaction.h"   // 提供 ReadAllEntries, GetNextSSTableNumber
+#include "manifest.h"
 
 namespace fs = std::filesystem;
 
 namespace leveled {
 
 // ------------------辅助函数-------------------
-bool RemoveFileWithRetry(const std::string& path, int max_retries = 3) {
+inline bool RemoveFileWithRetry(const std::string &path, int max_retries = 3) {
   for (int i = 0; i < max_retries; ++i) {
     std::error_code ec;
     std::filesystem::remove(path, ec);
@@ -62,7 +65,7 @@ class LeveledCompaction {
                     int max_level,
                     const std::vector<uint64_t> &level_sizes);
 
-  ~LeveledCompaction() = default;
+  ~LeveledCompaction();
 
   // 禁止拷贝，允许移动
   LeveledCompaction(const LeveledCompaction &) = delete;
@@ -119,6 +122,11 @@ class LeveledCompaction {
   std::vector<uint64_t> level_sizes_;         // 各层容量上限（字节）
   std::vector<std::unique_ptr<Level<K, V>>> levels_; // 各层对象
   mutable std::mutex mu_;                     // 线程安全锁
+  std::thread bg_thread_;                     // 后台 Compaction 工作线程，异步执行合并操作
+  std::condition_variable cv_;                // 条件变量，用于在合并任务到来或线程停止时唤醒后台线程
+  std::mutex compact_mu_;                     // 互斥锁，保护 need_compact_、stop_ 等合并相关状态
+  bool stop_ = false;                         // 停止标志：为 true 时后台线程应退出运行
+  bool need_compact_ = false;                 // 合并请求标志：为 true 表示存在待处理的合并任务
 
   /**
    * 返回下一层编号，若已是最高层则返回 -1
@@ -140,6 +148,29 @@ class LeveledCompaction {
    * @return 选中的文件索引
    */
   size_t PickFileToCompactFromL0() const;
+
+/**
+ * 唤醒后台合并线程：设置 need_compact_ 标志并通知条件变量。
+ */
+  void SignalCompact() {
+    {
+      std::lock_guard<std::mutex> lk(compact_mu_);
+      need_compact_ = true;   // 标记有合并任务待处理
+    }
+    cv_.notify_one();           // 唤醒一个正在等待的后台线程
+  }
+
+/**
+ * 后台 Compaction 工作循环。
+ * 作为独立线程运行，等待 need_compact_ 信号后执行分级合并，直到 stop_ 为 true。
+ */
+  void BackgroundCompactLoop();
+
+/**
+ * 将当前所有层级的元数据保存到 MANIFEST 文件。
+ * @return 成功返回 true，失败返回 false
+ */
+  bool PersistManifest();
 };
 
 // ========== 单个层 ==========
@@ -207,6 +238,12 @@ class Level {
    * 清空该层的所有文件（删除内存指针，不删除磁盘文件）
    */
   void Clear();
+
+  /**
+   * 收集当前层中所有 SSTable 文件的元数据信息（FileMeta），用于保存到 Manifest。
+   * @param metas  输出参数，清空后填充每个文件的元数据
+   */
+  void GetAllFileMeta(std::vector<FileMeta<K>> &metas) const;
 
  private:
   int level_num_;                             // 当前层层号（0 为 L0，允许重叠；≥1 为 L1+，要求有序且无重叠）
@@ -352,7 +389,7 @@ void Level<K, V>::MaintainOrderAndNonOverlap() {
   };
 
   // 扫描相邻文件，检测并合并重叠区域
-  for (size_t i = 1; i < files_.size(); ) {
+  for (size_t i = 1; i < files_.size();) {
     size_t start = i - 1;                 // 重叠区间的起始索引
     size_t end = i;                       // 当前扫描位置（第一个不重叠的索引）
     K cur_last;
@@ -408,7 +445,7 @@ void Level<K, V>::MaintainOrderAndNonOverlap() {
     }
     if (read_failed) {
       // 读取失败，无法合并，将旧文件放回并继续
-      for (auto& sst : old_ssts) {
+      for (auto &sst : old_ssts) {
         files_.push_back(std::move(sst));
       }
       // 重新排序
@@ -447,7 +484,7 @@ void Level<K, V>::MaintainOrderAndNonOverlap() {
         std::cerr << "Failed to build merged SSTable\n";
       }
       // 恢复旧文件
-      for (auto& sst : old_ssts) {
+      for (auto &sst : old_ssts) {
         files_.push_back(std::move(sst));
       }
       ++i;
@@ -456,7 +493,7 @@ void Level<K, V>::MaintainOrderAndNonOverlap() {
 
     // ---------- 合并成功，准备替换 ----------
     // 先关闭旧文件的所有文件流，以便安全删除
-    for (auto& sst : old_ssts) {
+    for (auto &sst : old_ssts) {
       sst->CloseFile();   // 假设 SSTable 有 CloseFile() 方法
     }
     // 释放旧文件对象（不再需要）
@@ -464,7 +501,7 @@ void Level<K, V>::MaintainOrderAndNonOverlap() {
 
     // 尝试删除所有旧物理文件
     bool all_deleted = true;
-    for (const auto& path : old_paths) {
+    for (const auto &path : old_paths) {
       if (!RemoveFileWithRetry(path)) {
         all_deleted = false;
       }
@@ -475,13 +512,13 @@ void Level<K, V>::MaintainOrderAndNonOverlap() {
       std::error_code ec;
       fs::remove(new_filename, ec);   // 删除刚生成的新文件
       // 重新加载旧文件（它们还在磁盘上）
-      for (const auto& path : old_paths) {
+      for (const auto &path : old_paths) {
         auto reloaded = std::make_unique<SSTable<K, V>>(path);
         files_.push_back(std::move(reloaded));
       }
       // 重新计算 total_bytes_ 并排序
       total_bytes_ = 0;
-      for (auto& f : files_) total_bytes_ += f->FileSize();
+      for (auto &f : files_) total_bytes_ += f->FileSize();
       MaintainOrderAndNonOverlap();   // 重新整理（可能还会触发合并）
       std::cerr << "Compaction rolled back due to file deletion failure.\n";
       return;
@@ -493,7 +530,7 @@ void Level<K, V>::MaintainOrderAndNonOverlap() {
 
     // 更新总字节数：减去旧文件大小（我们已经从 files_ 中删除了它们，所以重新计算）
     total_bytes_ = 0;
-    for (auto& f : files_) total_bytes_ += f->FileSize();
+    for (auto &f : files_) total_bytes_ += f->FileSize();
     total_bytes_ += new_size;
 
     // 将新文件插入到起始位置（保持有序）
@@ -503,6 +540,33 @@ void Level<K, V>::MaintainOrderAndNonOverlap() {
     MaintainOrderAndNonOverlap();
     return;
   }
+}
+
+//
+template<typename K, typename V>
+void Level<K, V>::GetAllFileMeta(std::vector<FileMeta<K>> &metas) const {
+metas.clear();
+metas.reserve(files_.size());                     // 预分配空间，避免多次扩容
+
+for (const auto &sst : files_) {
+FileMeta<K> meta;
+
+// 仅保存基础文件名（不含路径），恢复时会在目录下重建
+meta.filename = fs::path(sst->Filename()).filename().string();
+
+// 文件当前占用磁盘大小
+meta.file_size = sst->FileSize();
+
+// 从 SSTable 中读取最小键和最大键
+sst->GetFirstKey(meta.first_key);
+sst->GetLastKey(meta.last_key);
+
+// 版本号从文件名主干的数字部分解析（如 "123.sst" -> 123）
+std::string stem = fs::path(sst->Filename()).stem().string();
+meta.version = std::stoull(stem);
+
+metas.push_back(std::move(meta));
+}
 }
 
 // ==================== LeveledCompaction 实现 ====================
@@ -524,15 +588,29 @@ LeveledCompaction<K, V>::LeveledCompaction(const std::string &sst_dir,
   for (int i = 0; i < max_level_; ++i) {
     levels_.push_back(std::make_unique<Level<K, V>>(i, level_sizes_[i]));
   }
+  // 后台线程启动
+  bg_thread_ = std::thread(&LeveledCompaction::BackgroundCompactLoop, this);
+}
+
+template<typename K, typename V>
+LeveledCompaction<K, V>::~LeveledCompaction() {
+  {
+    std::lock_guard<std::mutex> lk(compact_mu_);
+    stop_ = true;
+  }
+  cv_.notify_all();
+  if (bg_thread_.joinable())
+    bg_thread_.join();
 }
 
 // 添加一个新的 SSTable 文件（通常来自 Flush），放入 L0，并触发必要的合并
 template<typename K, typename V>
 void LeveledCompaction<K, V>::AddSSTable(std::unique_ptr<SSTable<K, V>> sst) {
   if (!sst) return;
-  std::lock_guard<std::mutex> lock(mu_);      // 保证线程安全
+  std::lock_guard<std::mutex> lock(mu_);    // 保证线程安全
   levels_[0]->AddSSTable(std::move(sst));      // 放入第0层
-  MaybeCompact();                               // 检查是否需要合并
+  PersistManifest();                           // 立即持久化
+  SignalCompact();                             // 唤醒后台线程检查合并
 }
 
 // 在整个层级中查找键 key，从 L0 到高层依次查找
@@ -549,15 +627,7 @@ bool LeveledCompaction<K, V>::Get(const K &key, V &value) const {
 // 检查各层是否超过容量限制，若有则触发合并
 template<typename K, typename V>
 void LeveledCompaction<K, V>::MaybeCompact() {
-  for (int level = 0; level < max_level_; ++level) {
-    auto &lvl = levels_[level];
-    if (lvl->ExceedsLimit()) {
-      // 确定要合并的文件索引：L0 需要选择策略，L1+ 通常选第一个（文件有序，可选取任意）
-      size_t file_index = (level == 0) ? PickFileToCompactFromL0() : 0;
-      if (file_index < lvl->GetFiles().size())
-        DoCompact(level, file_index);
-    }
-  }
+  SignalCompact();
 }
 
 // 从 L0 中选择一个文件进行合并（策略：选择与下一层重叠数最多的文件，以减少后续重叠）
@@ -614,14 +684,14 @@ void LeveledCompaction<K, V>::DoCompact(int level, size_t file_index) {
   // ---------- 备份所有参与合并的文件 ----------
   std::vector<std::unique_ptr<SSTable<K, V>>> backup;
   backup.push_back(std::move(src_file));
-  for (auto& f : overlapping) {
+  for (auto &f : overlapping) {
     backup.push_back(std::move(f));
   }
   overlapping.clear();  // 不再需要原始的 overlapping
 
   // 收集所有文件信息（版本号 + 路径）
   std::vector<std::pair<uint64_t, std::string>> files_to_merge;
-  for (auto& sst : backup) {
+  for (auto &sst : backup) {
     uint64_t seq = std::stoull(fs::path(sst->Filename()).stem().string());
     files_to_merge.emplace_back(seq, sst->Filename());
   }
@@ -633,7 +703,7 @@ void LeveledCompaction<K, V>::DoCompact(int level, size_t file_index) {
   // 读取所有数据到内存（此时 backup 中的对象还持有文件，但我们需要读数据）
   std::vector<std::tuple<K, V, bool>> merged;
   std::unordered_set<K> seen_keys;
-  for (const auto& [seq, fname] : files_to_merge) {
+  for (const auto &[seq, fname] : files_to_merge) {
     std::vector<std::tuple<K, V, bool>> entries;
     if (!ReadAllEntries(fname, entries)) {
       std::cerr << "Failed to read " << fname << "\n";
@@ -644,8 +714,8 @@ void LeveledCompaction<K, V>::DoCompact(int level, size_t file_index) {
       }
       return;
     }
-    for (auto& entry : entries) {
-      const K& key = std::get<0>(entry);
+    for (auto &entry : entries) {
+      const K &key = std::get<0>(entry);
       bool tombstone = std::get<2>(entry);
       if (seen_keys.find(key) != seen_keys.end()) continue;
       if (!tombstone) {
@@ -658,9 +728,9 @@ void LeveledCompaction<K, V>::DoCompact(int level, size_t file_index) {
   // 如果没有有效条目，直接删除所有参与文件（不需要生成新文件）
   if (merged.empty()) {
     // 先关闭所有文件流以便删除
-    for (auto& sst : backup) sst->CloseFile();
+    for (auto &sst : backup) sst->CloseFile();
     backup.clear();
-    for (const auto& [seq, fname] : files_to_merge) {
+    for (const auto &[seq, fname] : files_to_merge) {
       RemoveFileWithRetry(fname);
     }
     return;
@@ -683,11 +753,11 @@ void LeveledCompaction<K, V>::DoCompact(int level, size_t file_index) {
 
   // ---------- 新文件构建成功，尝试删除旧文件 ----------
   // 先关闭所有旧文件的文件流
-  for (auto& sst : backup) sst->CloseFile();
+  for (auto &sst : backup) sst->CloseFile();
   backup.clear();   // 释放对象，文件流已关闭
 
   bool all_deleted = true;
-  for (const auto& [seq, fname] : files_to_merge) {
+  for (const auto &[seq, fname] : files_to_merge) {
     if (!RemoveFileWithRetry(fname)) {
       all_deleted = false;
     }
@@ -698,7 +768,7 @@ void LeveledCompaction<K, V>::DoCompact(int level, size_t file_index) {
     std::error_code ec;
     fs::remove(new_filename, ec);
     // 重新加载旧文件（从磁盘）
-    for (const auto& [seq, fname] : files_to_merge) {
+    for (const auto &[seq, fname] : files_to_merge) {
       auto reloaded = std::make_unique<SSTable<K, V>>(fname);
       if (fname == files_to_merge[0].second) {
         src_level->AddSSTable(std::move(reloaded));   // 第一个是源文件
@@ -713,6 +783,8 @@ void LeveledCompaction<K, V>::DoCompact(int level, size_t file_index) {
   // 删除成功，将新文件加入目标层
   auto new_sst = std::make_unique<SSTable<K, V>>(new_filename);
   dst_level->AddSSTable(std::move(new_sst));
+
+  PersistManifest();    // 一次持久化
 
   std::cout << "[Compaction] Merged level " << level << " into level " << next
             << ", new file: " << new_filename << " (" << merged.size() << " entries)\n";
@@ -771,21 +843,130 @@ std::vector<std::unique_ptr<IteratorInterface<K, V>>> LeveledCompaction<K, V>::G
   return iters;
 }
 
-// 从目录加载所有 SSTable 文件，全部放入 L0 后强制整理
+/**
+ * 从 SSTable 目录加载数据，优先从 Manifest 文件恢复层级结构；
+ * 若 Manifest 不存在或损坏，则扫描所有 .sst 文件放入 L0，并强制执行一次全量合并。
+ * 该函数应在系统启动时调用一次
+ */
 template<typename K, typename V>
 void LeveledCompaction<K, V>::LoadFromDir() {
-  std::lock_guard<std::mutex> lock(mu_);
-  if (!fs::exists(sst_dir_)) {
-    fs::create_directories(sst_dir_);
-    return;
+  std::lock_guard<std::mutex> lock(mu_);   // 保护 levels_ 等成员
+
+  uint64_t last_seq;
+  std::vector<std::vector<FileMeta<K>>> loaded_mates;
+
+  // 尝试从 Manifest 恢复层级信息
+  if (Manifest::Load(sst_dir_, loaded_mates, last_seq)) {
+
+    // 清空所有现有层级数据，按 Manifest 内容重建
+    for (int i = 0; i < max_level_; ++i) {
+      levels_[i]->Clear();                       // 清空该层
+      if (i < static_cast<int>(loaded_mates.size())) {
+        // 将 Manifest 中记录的该层每个 SSTable 重新打开并加入
+        for (const auto &meta : loaded_mates[i]) {
+          std::string full_path = sst_dir_ + "/" + meta.filename;
+          if (fs::exists(full_path)) {
+            auto sst = std::make_unique<SSTable<K, V>>(full_path);
+            levels_[i]->AddSSTable(std::move(sst));
+          } else {
+            std::cerr << "Warning: SSTable " << full_path << " missing\n";
+          }
+        }
+      }
+    }
+    std::cout << "Loaded from Manifest, last sequence: " << last_seq << std::endl;
+
+  } else {
+    // Manifest 不可用，回退到扫描目录方式
+    std::cerr << "No valid Manifest found, scanning directory...\n";
+
+    // 先清空所有层
+    for (auto &lvl : levels_) {
+      lvl->Clear();
+    }
+
+    // 扫描目录下所有 .sst 文件，全部作为 L0 文件
+    if (fs::exists(sst_dir_)) {
+      for (const auto &entry : fs::directory_iterator(sst_dir_)) {
+        if (entry.path().extension() != ".sst")
+          continue;
+        auto sst = std::make_unique<SSTable<K, V>>(entry.path().string());
+        levels_[0]->AddSSTable(std::move(sst));   // 放入 L0
+      }
+    }
+
+    // 强制执行全量合并，将 L0 数据逐渐推至合适层级
+    ForceCompaction();
+
+    // 合并完成后生成新的 Manifest 文件
+    PersistManifest();
   }
-  for (auto &lvl : levels_) lvl->Clear();
-  for (const auto &entry : fs::directory_iterator(sst_dir_)) {
-    if (entry.path().extension() != ".sst") continue;
-    auto sst = std::make_unique<SSTable<K, V>>(entry.path().string());
-    levels_[0]->AddSSTable(std::move(sst));
+}
+
+// ---------------------- 实现后台合并循环 ----------------------
+
+/**
+ * 后台合并线程的主循环。
+ * 等待合并信号（need_compact_）或停止信号（stop_），每次唤醒后检查各层容量，
+ * 对超限的层级执行一次 Compaction，然后持久化 Manifest。
+ * 执行完一次合并后，若可能还有未处理的超限层，会再次触发合并信号。
+ */
+template<typename K, typename V>
+void LeveledCompaction<K, V>::BackgroundCompactLoop() {
+  while (true) {
+    std::unique_lock<std::mutex> lk(compact_mu_);
+    // 等待条件：need_compact_ 为 true 或 stop_ 为 true
+    cv_.wait(lk, [this] { return need_compact_ || stop_; });
+    if (stop_)           // 收到停止信号，退出循环
+      break;
+    need_compact_ = false;   // 重置合并请求标志
+    lk.unlock();             // 释放 compact_mu_，避免长时间持有
+
+    bool did_work = false;
+    {
+      // 获取主锁 mu_，保护 levels_ 等数据结构
+      std::lock_guard<std::mutex> main_lock(mu_);
+
+      // 从 L0 到最高层遍历，寻找超限的层
+      for (int level = 0; level < max_level_; ++level) {
+        auto &lvl = levels_[level];
+        if (lvl->ExceedsLimit()) {
+          // L0 使用特殊策略选择文件，L1+ 直接选第一个文件（文件已有序）
+          size_t file_index = (level == 0) ? PickFileToCompactFromL0() : 0;
+          if (file_index < lvl->GetFiles().size()) {
+            DoCompact(level, file_index);   // 执行合并
+            PersistManifest();              // 合并后立即保存 Manifest
+            did_work = true;
+            break;  // 每次循环只做一个合并，释放锁后再检查后续需求
+          }
+        }
+      }
+    }
+
+    // 如果本次执行了合并，可能还有其他层需要处理，再次触发合并信号
+    if (did_work) {
+      SignalCompact();
+    }
   }
-  ForceCompaction();
+}
+
+/**
+ * 将当前所有层级的元数据（文件列表、键范围等）保存到 MANIFEST 文件。
+ * 内部调用 Manifest::Save 进行原子持久化。
+ * @return 成功返回 true，否则 false
+ */
+template<typename K, typename V>
+bool LeveledCompaction<K, V>::PersistManifest() {
+  // 收集每一层的 FileMeta 信息
+  std::vector<std::vector<FileMeta<K>>> all_metas;
+  all_metas.reserve(max_level_);
+  for (int i = 0; i < max_level_; ++i) {
+    std::vector<FileMeta<K>> metas;
+    levels_[i]->GetAllFileMeta(metas);
+    all_metas.push_back(std::move(metas));
+  }
+  // 委托 Manifest 工具类写入磁盘
+  return Manifest::Save(sst_dir_, all_metas);
 }
 
 } // namespace leveled

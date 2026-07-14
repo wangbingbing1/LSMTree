@@ -13,7 +13,7 @@
 
 // 通用 POD 类型写入（排除 std::string）
 template<typename T>
-typename std::enable_if<std::is_pod<T>::value && !std::is_same<T, std::string>::value>::type
+typename std::enable_if<std::is_trivially_copyable<T>::value && !std::is_same<T, std::string>::value>::type
 WriteBinary(std::ostream &os, const T &value) {
   os.write(reinterpret_cast<const char*>(&value), sizeof(T));
 }
@@ -21,13 +21,13 @@ WriteBinary(std::ostream &os, const T &value) {
 // std::string 特化写入：先写 4 字节长度，再写字符数据
 inline void WriteBinary(std::ostream &os, const std::string &str) {
   uint32_t len = static_cast<uint32_t>(str.size());
-  WriteBinary(os, len);          // 这里会调用 POD 版本（uint32_t 是 POD）
+  WriteBinary(os, len);          // 会调用 POD 版本（uint32_t 是平凡可拷贝）
   os.write(str.data(), len);
 }
 
-// 通用 POD 类型读取
+// 通用可平凡拷贝类型读取
 template<typename T>
-typename std::enable_if<std::is_pod<T>::value>::type
+typename std::enable_if<std::is_trivially_copyable<T>::value>::type
 ReadBinary(std::istream &is, T &value) {
   is.read(reinterpret_cast<char*>(&value), sizeof(T));
 }
